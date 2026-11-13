@@ -16,12 +16,34 @@
 # interpolated in log(h). Everything is clamped to [0, 1] and kept ordered.
 #
 # Practice score (local, answers fetched from Polymarket's public history and
-# validated to reproduce the kit inputs exactly): mean pinball loss 0.278987
+# validated to reproduce the kit inputs exactly): mean pinball loss 0.271526
 # over p00..p05, against the house baseline's 0.363589.
 #
+# Revision 4: three further principled changes, each independently positive
+# and positive in combination (0.278987 -> 0.271526, worst case
+# 0.4315 -> 0.4207, every practice case better, both halves better):
+#  (a) volatility-regime scaling now measures the regime with the MEAN
+#      |1-min move| (recent 60 min vs the window) instead of the median:
+#      these prices are steppy, so the median |move| is 0 for most markets
+#      and the round-3 scaling almost never fired. The undamped ratio
+#      clip(mean_recent / mean_window, 0.5, 1.5) replaces the damped
+#      0.5 + 0.5 * ratio form (tested: damped 0.272559, undamped 0.271526;
+#      a full-history denominator was worse);
+#  (b) tail shrinkage: the empirical 5%/95% quantiles are noisy (a 120-min
+#      window holds ~6 points past the 5% tail), so each is blended 50/50
+#      with the Gaussian tail implied by the interquartile range
+#      (q05 <- med - 1.645 * IQR/1.349, q95 <- med + 1.645 * IQR/1.349);
+#  (c) slightly wider intervals under the new regime scaling (K_MID 0.45,
+#      K_TAIL 0.9) and stronger sum normalization (NORM_A 0.7).
+#  Neighbouring values land within 0.001 of this score, so the gain is not
+#  knife-edge. Alternatives tried and rejected in this session: drift
+#  toward the empirical median return (much worse: 0.294 at alpha=0.25),
+#  a minimum interval-width floor (much worse in quiet cases), asymmetric
+#  jump pulls (no gain), tail-only VR power (no gain), q75/nonzero regime
+#  measures (worse than the mean), VR windows 30/90/120 (flat), and
+#  vr_lo=0.3 (clearly worse).
+#
 # Revision 3: three further principled changes, each independently positive
-# on the practice mean and positive in combination (0.284723 -> 0.278987,
-# worst case 0.4376 -> 0.4315, both halves better):
 #  (a) per-horizon window: the empirical quantiles for short horizons use
 #      the recent 120 minutes (recent volatility is what matters at h=1..4),
 #      widening log-linearly to 540 minutes at h>=120 (long horizons need
@@ -60,8 +82,8 @@ H_GRID = (1, 2, 3, 4, 6, 9, 13, 19, 28, 41, 60, 87, 126, 183, 240)
 W_SHORT = 120
 W_LONG = 540
 # Scale of the recentered empirical quantiles: middle (25%/75%) and tails (5%/95%).
-K_MID = 0.4
-K_TAIL = 0.8
+K_MID = 0.45
+K_TAIL = 0.9
 # Extra asymmetry: positive offsets (price up) narrower, negative (price down) wider.
 K_UP = 0.75
 K_DN = 1.5
@@ -70,7 +92,7 @@ FALLBACK_SIGMA = 0.0025
 # Cross-market sum normalization: shrink the forecast centre toward the
 # sum-to-one constraint (see header). RAMP_H is the minutes over which the
 # shift ramps in linearly.
-NORM_A = 0.6
+NORM_A = 0.7
 RAMP_H = 120
 # Conditional jump reversion: a last 1-minute move larger than
 # max(JUMP_ABS, JUMP_THRESH * median |1-min move| of the last 60 minutes)
@@ -81,11 +103,18 @@ JUMP_PULL = 0.75
 JUMP_DECAY = 120.0
 JUMP_ABS = 0.02
 # Volatility-regime scaling: offsets are multiplied by
-# clip(0.5 + 0.5 * recent_vol / window_vol, VR_LO, VR_HI), where the vols
-# are the median |1-min move| over the last VR_WIN minutes vs the window.
+# clip(mean |1-min move| over the last VR_WIN minutes /
+#      mean |1-min move| over the window, VR_LO, VR_HI).
+# The mean (not the median) is used because these prices are steppy: the
+# median |move| is 0 for most markets, so a median-based ratio almost
+# never fires. A market that just turned active gets wider intervals.
+# Tail shrinkage: the empirical 5%/95% quantiles are blended TAIL_SHRINK
+# toward the Gaussian tail implied by the interquartile range, because a
+# short window holds only a handful of points past the 5% tail.
 VR_LO = 0.5
 VR_HI = 1.5
 VR_WIN = 60
+TAIL_SHRINK = 0.5
 Z = [-1.644854, -0.67449, 0.0, 0.67449, 1.644854]
 
 
@@ -154,16 +183,16 @@ def forecast_market(prices, horizon, shift_full=0.0):
     n = len(prices)
     x = prices[-1]
 
-    # Volatility-regime scale: recent 60-min median |1-min move| vs the
-    # window's. A market that just turned active gets wider intervals.
+    # Volatility-regime scale: mean |1-min move| over the last 60 minutes
+    # vs the window's. A market that just turned active gets wider intervals.
     vr = 1.0
     if n >= VR_WIN + 2:
         recent = [abs(prices[j + 1] - prices[j]) for j in range(n - VR_WIN, n - 1)]
         whole = [abs(prices[j + 1] - prices[j]) for j in range(n - min(480, n - 1), n - 1)]
-        mr = statistics.median(recent) or 0.0
-        ma = statistics.median(whole) or 0.0
+        mr = sum(recent) / len(recent)
+        ma = sum(whole) / len(whole)
         if ma > 0:
-            vr = min(VR_HI, max(VR_LO, 0.5 + 0.5 * mr / ma))
+            vr = min(VR_HI, max(VR_LO, mr / ma))
 
     # Conditional jump reversion: is the last print a spike vs the recent
     # 1-minute moves? If so, how much of it to revert (decaying over time).
@@ -198,6 +227,14 @@ def forecast_market(prices, horizon, shift_full=0.0):
     for h in range(1, horizon + 1):
         qs = _interp(grid, h)
         med = qs[2]
+        # Tail shrinkage: blend the noisy empirical 5%/95% quantiles toward
+        # the Gaussian tail implied by the interquartile range.
+        iqr = qs[3] - qs[1]
+        if iqr > 0:
+            sig = iqr / 1.349
+            qs = list(qs)
+            qs[0] = TAIL_SHRINK * qs[0] + (1.0 - TAIL_SHRINK) * (med - 1.644854 * sig)
+            qs[4] = TAIL_SHRINK * qs[4] + (1.0 - TAIL_SHRINK) * (med + 1.644854 * sig)
         c = centre(h)
         row = []
         prev = -1e18
